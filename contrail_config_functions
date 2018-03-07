@@ -1034,3 +1034,28 @@ function fixup_config_files()
     fi
 
 }
+
+function config_hugepages()
+{
+    SYSCTL_CFG="/etc/sysctl.conf"
+    HPS_NAME="vm.nr_hugepages"
+    HPS_STR="${HPS_NAME}=${DPDK_HUGEPAGES}"
+    HPS=$(grep ${HPS_NAME} ${SYSCTL_CFG} | cut -d'=' -f2)
+    echo Setting hugepages to ${DPDK_HUGEPAGES}
+    if [ -z ${HPS} ]; then
+        echo Hugepages is not yet configured, set to ${DPDK_HUGEPAGES}
+        sudo bash -c "echo \"${HPS_STR}\" >> ${SYSCTL_CFG}"
+        sudo sysctl -w ${HPS_STR}
+    elif [[ ${HPS} -lt ${DPDK_HUGEPAGES} ]]; then
+        echo Hugepages size of ${HPS} needs to be increased to ${DPDK_HUGEPAGES}
+        sudo sysctl -w ${HPS_STR}
+        CURR_HPS=$(grep ${HPS_NAME} ${SYSCTL_CFG})
+        sudo sed -i -e 's/'"${CURR_HPS}"'/'"${HPS_STR}"'/g' ${SYSCTL_CFG}
+    else
+        echo Hugepages size of ${HPS} is good
+    fi
+    if ! has_hugepages; then
+        echo "FATAL: Failed to enable hugepages!"
+        exit 1
+    fi
+}

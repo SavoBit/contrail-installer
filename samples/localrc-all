@@ -59,3 +59,6 @@ CONTRAIL_VGW_PUBLIC_NETWORK=default-domain:demo:net:net
 
 # HW acceleration method (none, DPDK, FDIO)
 # HW_ACCEL=none
+# DPDK_UIO_DRIVER=uio_pci_generic (uio, uio_pci_generic)
+# DPDK_HUGEPAGES=1024
+

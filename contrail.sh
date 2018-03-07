@@ -42,6 +42,10 @@ unset LANGUAGE
 LC_ALL=C
 export LC_ALL
 
+# Initialize DPDK default driver and hugepages count
+DPDK_UIO_DRIVER=${DPDK_UIO_DRIVER:-"uio_pci_generic"}
+DPDK_HUGEPAGES=${DPDK_HUGEPAGES:-1024}
+
 # Set up logging level
 CONTRAIL_REPO_PROTO=${CONTRAIL_REPO_PROTO:-ssh}
 CONTRAIL_SRC=${CONTRAIL_SRC:-/opt/stack/contrail}
@@ -727,15 +731,15 @@ function build_contrail() {
         
         if [ "$INSTALL_PROFILE" = "ALL" ]; then
             if [[ $(read_stage) == "fetch-packages" ]]; then
-                sudo scons $SCONS_ARGS
+                scons $SCONS_ARGS
                 ret_val=$?
                 [[ $ret_val -ne 0 ]] && exit $ret_val
                 change_stage "fetch-packages" "Build"
             fi
         elif [ "$INSTALL_PROFILE" = "COMPUTE" ]; then
             if [[ $(read_stage) == "fetch-packages" ]]; then
-                sudo scons $SCONS_ARGS controller/src/vnsw
-                sudo scons $SCONS_ARGS vrouter
+                scons $SCONS_ARGS controller/src/vnsw
+                scons $SCONS_ARGS vrouter
                 ret_val=$?
                 [[ $ret_val -ne 0 ]] && exit $ret_val
                 change_stage "fetch-packages" "Build"          
@@ -782,9 +786,8 @@ function install_contrail() {
     [[ $? -eq 1 ]] && invalid_option_exit "install"
 
     # Checking if Hugepages are enabled if DPDK option is ON
-    if is_dpdk_on && ! has_hugepages ; then
-        echo "DPDK requires hugepages to be enabled"
-        exit 1
+    if is_dpdk_on ; then
+       config_hugepages    # it'll abort if hugepages can't be enabled
     fi
 
     cd $CONTRAIL_SRC
@@ -948,6 +951,50 @@ function test_install_cassandra_patch() {
     apply_patch $TOP_DIR/cassandra-env.sh.patch /etc/cassandra sudo
 }
 
+# set up DPDK related environments
+function insert_vrouter_dpdk() {
+    if [[ "$CONTRAIL_DEFAULT_INSTALL" == "True" ]]; then
+        die "DPDK only supports from the source mode, not package mode!"
+    fi
+    if ! is_ubuntu; then
+         die "DPDK only supports Ubuntu Linux"
+    fi
+
+    #get the physical interface IP information from 'ifconfig'
+    DEVICE=vhost0
+    IPADDR=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*inet [[addr]*]*[: ]*\([0-9.]*\).*/\1/i p')
+    NETMASK=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*[[net]*]*mask[: *]\([0-9.]*\).*/\1/i p')
+
+    sudo sysctl -w net.core.wmem_max=9160000
+    # increase ulimit settings, from "vnagent_ExecStartPre.sh"
+    ulimit -s unlimited
+    ulimit -c unlimited
+    ulimit -d unlimited
+    ulimit -v unlimited
+    ulimit -n 4096
+    # load DPDK modules and bind interface
+    sudo modprobe ${DPDK_UIO_DRIVER}
+    sudo insmod $CONTRAIL_SRC/build/production/vrouter/dpdk/x86_64-native-linuxapp-gcc/kmod/igb_uio.ko
+    sudo insmod $CONTRAIL_SRC/build/production/vrouter/dpdk/x86_64-native-linuxapp-gcc/kmod/rte_kni.ko
+    sudo ifconfig ${PHYSICAL_INTERFACE} down
+    sudo $CONTRAIL_SRC/third_party/dpdk/usertools/dpdk-devbind.py --bind=igb_uio ${PHYSICAL_INTERFACE}
+
+    #start vRouter-DPDK in daemon mode with core 2
+    sudo taskset -c 2 /usr/bin/contrail-vrouter-dpdk --socket-mem ${DPDK_HUGEPAGES} ${DPDK_HUGEPAGES}
+
+    return
+    VIF=$CONTRAIL_SRC/build/$TARGET/vrouter/utils/vif
+    DEV_MAC=$(cat /sys/class/net/$dev/address)
+
+    echo "Adding $dev to vrouter"
+    sudo $VIF --add $dev --mac $DEV_MAC --vrf 0 --vhost-phys --type physical --pmd --id 0 \
+	|| echo "Error adding $dev to vrouter"
+
+    echo "Adding $DEVICE to vrouter"
+    sudo $VIF --add $DEVICE --mac $DEV_MAC --vrf 0 --xconnect 0 --type vhost --pmd --id 1 \
+	|| echo "Error adding $DEVICE to vrouter"
+}
+
 # take over physical interface
 function insert_vrouter() {
     source /etc/contrail/contrail-compute.conf
@@ -958,19 +1005,11 @@ function insert_vrouter() {
 	DEVICE=vhost0
         IPADDR=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*inet [[addr]*]*[: ]*\([0-9.]*\).*/\1/i p')
         NETMASK=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*[[net]*]*mask[: *]\([0-9.]*\).*/\1/i p')
-
     fi
+
     # don't die in small memory environments
     if [[ "$CONTRAIL_DEFAULT_INSTALL" != "True" ]]; then
-        if is_dpdk_on; then
-            sudo modprobe uio_pci_generic
-            sudo insmod $CONTRAIL_SRC/build/production/vrouter/dpdk/x86_64-native-linuxapp-gcc/kmod/igb_uio.ko
-            sudo insmod $CONTRAIL_SRC/build/production/vrouter/dpdk/x86_64-native-linuxapp-gcc/kmod/rte_kni.ko
-            sudo $CONTRAIL_SRC/third_party/dpdk/usertools/dpdk-devbind.py --bind=igb_uio ${PHYSICAL_INTERFACE}
-            sudo taskset -c 2 /usr/bin/contrail-vrouter-dpdk --socket-mem 1024 1024
-        else
-            sudo insmod $CONTRAIL_SRC/vrouter/$kmod vr_flow_entries=2048 vr_oflow_entries=256 vr_bridge_entries=256
-        fi
+        sudo insmod $CONTRAIL_SRC/vrouter/$kmod vr_flow_entries=2048 vr_oflow_entries=256 vr_bridge_entries=256
         if [[ $? -eq 1 ]] ; then 
             exit 1
         fi
@@ -989,21 +1028,16 @@ function insert_vrouter() {
         VIF=/usr/bin/vif
     fi 
 
-    PMD=""
-    if is_dpdk_on; then
-        PMD="--pmd"
-    fi
-
     DEV_MAC=$(cat /sys/class/net/$dev/address)
     sudo $VIF --create $DEVICE --mac $DEV_MAC \
         || echo "Error creating interface: $DEVICE"
 
     echo "Adding $dev to vrouter"
-    sudo $VIF --add $dev --mac $DEV_MAC --vrf 0 --vhost-phys --type physical ${PMD} \
+    sudo $VIF --add $dev --mac $DEV_MAC --vrf 0 --vhost-phys --type physical \
 	|| echo "Error adding $dev to vrouter"
 
     echo "Adding $DEVICE to vrouter"
-    sudo $VIF --add $DEVICE --mac $DEV_MAC --vrf 0 --xconnect $dev --type vhost ${PMD} \
+        sudo $VIF --add $DEVICE --mac $DEV_MAC --vrf 0 --xconnect $dev --type vhost \
 	|| echo "Error adding $DEVICE to vrouter"
 
     if is_ubuntu; then
@@ -1052,7 +1086,7 @@ function test_insert_vrouter ()
 	if lsmod | grep -q igb_uio; then
             echo "igb_uio already inserted"
         else
-            insert_vrouter
+            insert_vrouter_dpdk
             echo "vrouter DPDK modules inserted."
         fi
     else
@@ -1274,14 +1308,14 @@ EOF2
         cat > $TOP_DIR/bin/vnsw.hlpr <<END
 #! /bin/bash
 PATH=$TOP_DIR/bin:$PATH
-LD_LIBRARY_PATH=$CONTRAIL_SRC/build/lib $CONTRAIL_SRC/build/$TARGET/vnsw/agent/contrail/contrail-vrouter-agent --config_file=/etc/contrail/contrail-vrouter-agent.conf --DEFAULT.log_file=/var/log/vrouter.log 
+LD_LIBRARY_PATH=$CONTRAIL_SRC/build/lib $CONTRAIL_SRC/build/$TARGET/vnsw/agent/contrail/contrail-vrouter-agent --config_file=/etc/contrail/contrail-vrouter-agent.conf --DEFAULT.log_file=/var/log/contrail/contrail-vrouter-agent.log 
 END
   
     else
         cat > $TOP_DIR/bin/vnsw.hlpr <<END
 #! /bin/bash
 PATH=$TOP_DIR/bin:$PATH
-LD_LIBRARY_PATH=/usr/lib /usr/bin/contrail-vrouter-agent --config_file=/etc/contrail/contrail-vrouter-agent.conf --DEFAULT.log_file=/var/log/vrouter.log 
+LD_LIBRARY_PATH=/usr/lib /usr/bin/contrail-vrouter-agent --config_file=/etc/contrail/contrail-vrouter-agent.conf --DEFAULT.log_file=/var/log/contrail/contrail-vrouter-agent.log 
 END
     fi
     chmod a+x $TOP_DIR/bin/vnsw.hlpr
